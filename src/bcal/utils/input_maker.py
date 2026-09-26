@@ -186,9 +186,7 @@ def compare_coordinates(
         symmetry operation maps the dimer onto the reference (the two are not
         actually the same dimer type). When several operations match equally
         well -- a benign ambiguity for dimers with their own point-group
-        symmetry -- the best one is returned; the resulting orbital-gauge
-        difference is absorbed downstream by the self-overlap repair in
-        :meth:`Bcal._build_embedded_mo` and :meth:`Bcal._enforce_hermiticity`.
+        symmetry -- the best one is returned.
     atoms_order : np.ndarray or None
         Per-atom mapping indices of length ``2 * n_atoms``. ``None`` if no atom
         reordering is needed.

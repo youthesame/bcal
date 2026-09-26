@@ -169,9 +169,6 @@ class Bcal:
         self.homo_em_vectors: Optional[np.ndarray] = None
         self.lumo_em_vectors: Optional[np.ndarray] = None
 
-        self._autos_cache: dict = {}
-        self._hermitian_warned = False
-
         self._ext_log = "out" if platform.system().lower() == "windows" else "log"
 
     # ------------------------------------------------------------------ #
@@ -940,74 +937,42 @@ class Bcal:
         focks[transposed] = focks[transposed][:, inv_index][:, :, inv_index]
         overlaps[transposed] = overlaps[transposed][:, inv_index][:, :, inv_index]
 
-        mo1, clean1 = self._build_embedded_mo(self.pairs[:, 0], first_block=True, mat=overlaps)
-        mo2, clean2 = self._build_embedded_mo(self.pairs[:, 1], first_block=False, mat=overlaps)
+        mo1 = self._build_embedded_mo(self.pairs[:, 0], first_block=True, mat=overlaps)
+        mo2 = self._build_embedded_mo(self.pairs[:, 1], first_block=False, mat=overlaps)
 
         self.trans = self._cal_transfer(mo1, overlaps, focks, mo2) * 1e-3  # meV -> eV
-        self._enforce_hermiticity(clean1 & clean2)
+        self._enforce_hermiticity()
         return self.trans
 
-    def _enforce_hermiticity(self, clean: np.ndarray) -> None:
+    def _enforce_hermiticity(self) -> None:
         """Make reverse-pair transfer blocks exact transposes of forward ones.
 
         Hermiticity of the tight-binding ``H(k)`` requires the block of pair
         ``(b, a, -R)`` to equal the transpose of the block of pair ``(a, b, R)``
         (the dimer Fock matrix is symmetric, so ``<a_x|F|b_y> = <b_y|F|a_x>``).
-        The per-pair self-overlap repair in :meth:`_build_embedded_mo` restores
-        the self-overlap but may pick a monomer automorphism that differs
-        between a pair and its reverse, breaking that transpose relation and
-        making ``H(k)`` non-Hermitian. Here the trusted member of each
-        ``{(a, b, R), (b, a, -R)}`` orbit -- the one embedded with the identity
-        automorphism (``clean``), which preserves the monomer orbital gauge --
-        is propagated to its partner by transposition.
-
-        Parameters
-        ----------
-        clean : numpy.ndarray of bool, shape (n_pairs,)
-            True where both monomers of the pair used the identity automorphism.
+        The two blocks are averaged if they agree within 1e-3 eV.
         """
         pairs = self.pairs[:, :5]
         index = {tuple(int(v) for v in row): i for i, row in enumerate(pairs)}
-        unresolved = False
-        orphans: list[tuple[int, int, int, int, int]] = []
+        partners = []
         for i, (cent, nei, sx, sy, sz) in enumerate(pairs):
             partner = index.get((int(nei), int(cent), -int(sx), -int(sy), -int(sz)))
             if partner is None:
-                # No reverse pair (b, a, -R) for this (a, b, R): the block has
-                # no transpose to be matched against, so H(k) cannot be made
-                # exactly Hermitian. This points to a pair dropped during input
-                # generation (see compare_coordinates in input_maker.py).
-                orphans.append((int(cent), int(nei), int(sx), int(sy), int(sz)))
-                continue
-            if partner == i:
-                # Self-reverse pair (on-site, R = 0): force the block symmetric.
-                self.trans[i] = 0.5 * (self.trans[i] + self.trans[i].T)
-            elif clean[partner] and not clean[i]:
-                self.trans[i] = self.trans[partner].T
-            elif not clean[i] and not clean[partner]:
-                # Neither member is trustworthy: symmetrise to stay Hermitian.
-                herm = 0.5 * (self.trans[i] + self.trans[partner].T)
-                self.trans[i] = herm
-                self.trans[partner] = herm.T
-                unresolved = True
-        if unresolved:
-            logger.warning("Transfer-integral gauge unresolved for some pairs; symmetrised H(k).")
-        if orphans:
-            logger.warning(
-                f"{len(orphans)} pair(s) have no reverse partner; "
-                f"H(k) cannot be made Hermitian: {orphans}"
-            )
+                raise ValueError(f"Pair {pairs[i].tolist()} has no reverse partner.")
+            diff = np.abs(self.trans[i] - self.trans[partner].T).max()
+            if diff > 1e-3:
+                raise ValueError(
+                    f"Pair {pairs[i].tolist()} is not the transpose of "
+                    f"its reverse partner: max |t - t_rev^T| = {diff:.3e} eV"
+                )
+            partners.append(partner)
+        self.trans = 0.5 * (self.trans + self.trans[partners].transpose(0, 2, 1))
 
-    def _build_embedded_mo(
-        self, mol_idx: np.ndarray, first_block: bool, mat: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_embedded_mo(self, mol_idx: np.ndarray, first_block: bool, mat: np.ndarray) -> np.ndarray:
         """Embed monomer MOs into the dimer basis with symmetry-correct alignment.
 
         For each pair the monomer MO is transformed (window slice, zero-pad,
-        atom reorder, AO sign flip) into the dimer basis. The geometric
-        ``atoms_order`` can be ambiguous for molecules with point-group symmetry
-        (it may pick a self-symmetry image), so among the monomer's own
-        automorphisms the one giving unit self-overlap is selected per pair.
+        atom reorder, AO sign flip) into the dimer basis.
 
         Parameters
         ----------
@@ -1021,13 +986,8 @@ class Bcal:
 
         Returns
         -------
-        mo : numpy.ndarray, shape (n_pairs, n, 2*n_basis)
+        numpy.ndarray, shape (n_pairs, n, 2*n_basis)
             Embedded MO coefficient vectors.
-        used_identity : numpy.ndarray of bool, shape (n_pairs,)
-            True for pairs where the identity automorphism was kept (i.e. no
-            self-symmetry repair was applied). Such embeddings preserve the
-            monomer orbital gauge and are the trusted member of each
-            reverse-pair orbit; see :meth:`_enforce_hermiticity`.
         """
         n = self.n
         nb = self.n_basis
@@ -1035,68 +995,22 @@ class Bcal:
         sign_conv = np.prod(
             self.pairs[:, 7:10].astype(np.float64)[:, np.newaxis, :] ** self.ao_xyz[np.newaxis, :, :], axis=2
         )
-        candidates = self._automorphism_candidates()  # identity is always candidate 0
+        mo = self.MOs[mol_idx].transpose(0, 2, 1)[:, self.n_elect + start : self.n_elect + end, :]
+        if first_block:
+            mo = np.concatenate([mo, np.zeros_like(mo)], axis=-1)
+        else:
+            mo = np.concatenate([np.zeros_like(mo), mo], axis=-1)
+        self._apply_atom_reorder(mo)
+        if first_block:
+            mo[:, :, :nb] *= sign_conv[:, np.newaxis, :]
+            dev = np.abs(_self_term_bra(mo, mat)[:, :, 0] - 1).max()
+        else:
+            mo[:, :, nb:] *= sign_conv[:, np.newaxis, :]
+            dev = np.abs(_self_term_ket(mo, mat)[:, 0, :] - 1).max()
 
-        best_mo: Optional[np.ndarray] = None
-        best_dev: Optional[np.ndarray] = None
-        best_idx: Optional[np.ndarray] = None
-        for cand_idx, (ao_src, ao_sign) in enumerate(candidates):
-            # Apply the candidate automorphism to every monomer MO on the AO axis.
-            mo = self.MOs[mol_idx][:, ao_src, :] * ao_sign[np.newaxis, :, np.newaxis]
-            mo = mo.transpose(0, 2, 1)[:, self.n_elect + start : self.n_elect + end, :]
-            if first_block:
-                mo = np.concatenate([mo, np.zeros_like(mo)], axis=-1)
-            else:
-                mo = np.concatenate([np.zeros_like(mo), mo], axis=-1)
-            self._apply_atom_reorder(mo)
-            if first_block:
-                mo[:, :, :nb] *= sign_conv[:, np.newaxis, :]
-                dev = np.abs(_self_term_bra(mo, mat)[:, :, 0] - 1).max(axis=1)
-            else:
-                mo[:, :, nb:] *= sign_conv[:, np.newaxis, :]
-                dev = np.abs(_self_term_ket(mo, mat)[:, 0, :] - 1).max(axis=1)
-
-            if best_mo is None:
-                best_mo, best_dev = mo, dev
-                best_idx = np.zeros(dev.shape[0], dtype=np.int64)
-            else:
-                # Only repair pairs that still fail the self-overlap check; the
-                # identity (first candidate) is kept for already-correct pairs,
-                # since applying an automorphism there would keep S=1 but flip
-                # the parity/sign and corrupt the (otherwise correct) integral.
-                improve = (dev < best_dev) & (best_dev > 1e-3)
-                best_mo[improve] = mo[improve]
-                best_dev[improve] = dev[improve]
-                best_idx[improve] = cand_idx
-
-        if best_dev.max() > 1e-2:
-            logger.warning(f"Self overlap is not unity: max |S-1| = {best_dev.max():.3e}")
-        return best_mo, best_idx == 0
-
-    def _automorphism_candidates(self) -> list[Tuple[np.ndarray, np.ndarray]]:
-        """Return the de-duplicated union of all sites' monomer automorphisms.
-
-        The identity is always first. Candidates are used to resolve the
-        atom-correspondence ambiguity of symmetric molecules by selecting, per
-        pair, the one giving unit self-overlap.
-
-        Returns
-        -------
-        list of (numpy.ndarray, numpy.ndarray)
-            ``(ao_src, ao_sign)`` AO-level operations.
-        """
-        if "_union" in self._autos_cache:
-            return self._autos_cache["_union"]
-        candidates: list[Tuple[np.ndarray, np.ndarray]] = []
-        seen: set = set()
-        for site in range(self.m):
-            for ao_src, ao_sign in self._monomer_automorphisms(site):
-                key = (ao_src.tobytes(), ao_sign.tobytes())
-                if key not in seen:
-                    seen.add(key)
-                    candidates.append((ao_src, ao_sign))
-        self._autos_cache["_union"] = candidates
-        return candidates
+        if dev > 1e-3:
+            raise ValueError(f"Self overlap is not unity: max |S-1| = {dev:.3e}")
+        return mo
 
     def _apply_atom_reorder(self, mo: np.ndarray) -> None:
         """Reorder MO AO columns in place per pair according to ``atoms_order``."""
@@ -1113,54 +1027,6 @@ class Bcal:
             mask = (self.atoms_order == unique_ao).all(axis=-1)
             idx = np.where(mask)[0]
             mo[mask] = mo[np.ix_(idx, np.arange(n), mo_order)]
-
-    def _monomer_automorphisms(self, site_idx: int) -> list[Tuple[np.ndarray, np.ndarray]]:
-        """Geometric self-symmetries of a monomer as AO-level (perm, sign) ops.
-
-        A monomer automorphism is an axis sign-flip ``s`` (in ``{+1,-1}^3``)
-        together with the atom permutation that maps the (centered) molecule
-        onto itself. Identity is always included. These are used to resolve the
-        atom-correspondence ambiguity of symmetric molecules.
-
-        Parameters
-        ----------
-        site_idx : int
-            Index of the unique molecule.
-
-        Returns
-        -------
-        list of (numpy.ndarray, numpy.ndarray)
-            For each automorphism, ``(ao_src, ao_sign)``: the AO source-gather
-            indices (length n_basis) and the per-AO sign factor.
-        """
-        if site_idx in self._autos_cache:
-            return self._autos_cache[site_idx]
-        cart = np.asarray(self.sites[site_idx]["frac"]) @ self.lattice
-        cart = cart - cart.mean(axis=0)
-        symbols = np.asarray(self.sites[site_idx]["symbols"])
-        ranges = self._atom_ao_ranges()
-        block_sizes = ranges[:, 1] - ranges[:, 0]
-        autos: list[Tuple[np.ndarray, np.ndarray]] = []
-        for s in itertools.product((1, -1), repeat=3):
-            s = np.array(s)
-            transformed = cart * s
-            dist = np.sqrt(((transformed[:, np.newaxis, :] - cart[np.newaxis, :, :]) ** 2).sum(axis=-1))
-            perm = dist.argmin(axis=1)
-            # A genuine automorphism is a bijection that maps each atom onto a
-            # coincident one of the same element (hence the same AO-block size).
-            if np.unique(perm).size != self.n_atoms or dist[np.arange(self.n_atoms), perm].max() >= 1e-3:
-                continue
-            if not (symbols[perm] == symbols).all() or not (block_sizes[perm] == block_sizes).all():
-                continue
-            ao_src = np.empty(self.n_basis, dtype=np.int64)
-            for a in range(self.n_atoms):
-                s0, e0 = ranges[a]
-                s1, e1 = ranges[perm[a]]
-                ao_src[s0:e0] = np.arange(s1, e1)
-            ao_sign = np.prod(s.astype(np.float64) ** self.ao_xyz, axis=1)
-            autos.append((ao_src, ao_sign))
-        self._autos_cache[site_idx] = autos
-        return autos
 
     def _atom_ao_ranges(self) -> np.ndarray:
         """Return per-atom AO ``[start, end)`` ranges from ``ao_atom``."""
@@ -1248,9 +1114,8 @@ class Bcal:
         h = h.transpose(1, 3, 0, 2, 4)
         np.add.at(h, (pairs[:, 0], pairs[:, 1]), phase_trans)
         h = h.transpose(2, 0, 3, 1, 4)
-        if not self._hermitian_warned and not _is_hermitian(h.reshape(k.shape[0], m * n, m * n)):
-            logger.warning("Hamiltonian is not Hermitian matrix.")
-            self._hermitian_warned = True
+        if not _is_hermitian(h.reshape(k.shape[0], m * n, m * n)):
+            raise ValueError("Hamiltonian is not Hermitian matrix.")
 
         return LA.eigvalsh(h.reshape(k.shape[0], m * n, m * n))
 
